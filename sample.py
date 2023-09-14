@@ -7,8 +7,11 @@ from contextlib import nullcontext
 import torch
 import tiktoken
 from model import GPTConfig, GPT
+import matplotlib.pyplot as plt
+from math import sin
 
 # -----------------------------------------------------------------------------
+regression = False
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
@@ -21,6 +24,10 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
+
+if regression:
+    start = 1
+    temperature = 1.0
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
@@ -68,22 +75,34 @@ if load_meta:
     decode = lambda l: ''.join([itos[i] for i in l])
 else:
     # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
+    # print("No meta.pkl found, assuming GPT-2 encodings...")
+    # enc = tiktoken.get_encoding("gpt2")
+    # encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    # decode = lambda l: enc.decode(l)
+    print('using custom encodings')
+    encode = lambda s: s
+    decode = lambda l: l
 
 # encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
+# if start.startswith('FILE:'):
+#     with open(start[5:], 'r', encoding='utf-8') as f:
+#         start = f.read()
 start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+if regression:
+    x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...][:, None]
+else:
+    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
+            data = [int(65*sin(i*0.1 + 6)/2) + 65/2 for i in range(max_new_tokens)]
+            # plot data and predictions together
+            plt.plot(data)
+            plt.plot(y[0].tolist())
+            plt.show()
+            # print(decode(y[0].tolist()))
             print('---------------')

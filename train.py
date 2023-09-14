@@ -54,6 +54,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+regression = False
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -113,13 +114,21 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+if regression:
+    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.float32, mode='r')
+    val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.float32, mode='r')
+else:
+    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    if regression:
+        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.float32)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.float32)) for i in ix])
+    else:
+        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -142,14 +151,17 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, regression=regression) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    if regression:
+        model_args['vocab_size'] = 1
+    else:
+        model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 65
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':

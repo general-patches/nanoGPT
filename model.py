@@ -114,6 +114,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    regression: bool = False # True: regression, False: classification
 
 class GPT(nn.Module):
 
@@ -173,19 +174,75 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
+        x = None
+        if self.config.regression:
+            # print('regression')
+            # print('input')
+            # print(idx[0])
+            idx = idx[:,:,None]
+            pos_emb = self.transformer.wpe(pos)
+            # idx = idx.repeat(1, 1, self.config.n_embd)
+            # pos_emb = pos
+            # for i in range(t):
+            #     pos_emb[i] = math.sin(pos_emb[i]*(1/(i + 1)))
+            # pos_emb = pos_emb[:,None]
+            # pos_emb = pos_emb.repeat(1, self.config.n_embd)
+            # x = self.transformer.drop(idx + pos_emb)
+
+            # print('shaped')
+            # print(idx[0])
+            x = self.transformer.drop(idx + pos_emb)
+            # print('dropped')
+            # print(idx[0])
+            # print(idx.shape)
+            # print(idx[0][0][0])
+            # print(idx[0][0][0].dtype)
+            # exit()
+        else:
+            tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
+            # print(tok_emb.shape)
+            # print(tok_emb[0][0][0])
+            # print(tok_emb[0][0][0].dtype)
+            # exit()
+
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        # tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # x = self.transformer.drop(idx) # + pos_emb)
+        # print('before layers')
+        # print(x[0])
+        # print(x.shape)
+        # exit()
         for block in self.transformer.h:
             x = block(x)
+        # print('after layers')
+        # print(x[0])
+        # if not self.config.regression:
         x = self.transformer.ln_f(x)
+        # print('after ln_f')
+        # print(x[0])
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = None
+            # print('logits')
+            # print(logits[0])
+            # print('targets')
+            # print(targets[0])
+            # print(logits.shape)
+            # print(logits.view(-1, logits.size(-1)).shape)
+            # print(targets.shape)
+            # print(targets.view(-1).shape)
+            # exit()
+            if self.config.regression:
+                loss = F.mse_loss(logits.view(-1), targets.view(-1), reduction='sum')
+            else:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
+            # print('right before lm_head')
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
@@ -311,20 +368,37 @@ class GPT(nn.Module):
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
+            # print(idx)
+            # print(idx.shape)
+            # print(idx[0])
+            # print(idx[0][0].dtype)
+            # exit()
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            if self.config.regression:
+                # print(logits)
+                logits = logits[:, -1, :]
+                # print(logits.shape)
+                # exit()
+                # print(logits)
+                idx = torch.cat((idx, logits), dim=1)
+            else:
+                # pluck the logits at the final step and scale by desired temperature
+                # print(logits.shape)
+                logits = logits[:, -1, :] / temperature
+                # print(logits.shape)
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # append sampled index to the running sequence and continue
+                # print(idx_next.shape)
+                # exit()
+                idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
