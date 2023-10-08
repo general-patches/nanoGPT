@@ -5,15 +5,16 @@ import os
 import pickle
 from contextlib import nullcontext
 import torch
-import tiktoken
+from sklearn.metrics import r2_score, mean_absolute_percentage_error, mean_absolute_error, mean_squared_error
 from model import GPTConfig, GPT
 import matplotlib.pyplot as plt
-from math import sin
+import numpy as np
 
 # -----------------------------------------------------------------------------
-regression = False
+regression = True
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
+# out_dir = 'out' # ignored if init_from is not 'resume'
+dataset = 'sunspot'
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -23,12 +24,39 @@ seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
+num_start_samples = 50
+prediction_length = 10
 exec(open('configurator.py').read()) # overrides from command line or config file
 
+data = None
+mean = None
+std = None
 if regression:
-    start = 1
     temperature = 1.0
+    data = np.memmap(os.path.join('data', dataset, 'test.bin'), dtype=np.float32, mode='r')
+    max_new_tokens = len(data) - num_start_samples
+    start = data[:num_start_samples]
+    with open(os.path.join('data', dataset, 'meta.txt'), 'r') as f:
+        mean = float(f.readline().split('=')[1])
+        std = float(f.readline().split('=')[1])
 # -----------------------------------------------------------------------------
+
+def restore_scale(input):
+    return input * std + mean
+
+def mean_absolute_error_naive(actual):
+    sum = 0
+    for i in range(1, len(actual)):
+        sum += abs(actual[i] - actual[i - 1])
+    return sum / (len(actual) - 1)
+
+def mean_absolute_scaled_error(actual, predicted):
+    mae = mean_absolute_error(actual, predicted)
+    naive_mae = mean_absolute_error_naive(actual)
+    return mae / naive_mae
+
+def symmetric_mean_absolute_percentage_error(acutal, predicted):
+    return 100 * np.mean(np.abs(predicted - acutal) / ((np.abs(acutal) + np.abs(predicted)) / 2))
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
@@ -41,7 +69,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(f"out-{dataset}", 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
@@ -90,19 +118,51 @@ else:
 start_ids = encode(start)
 
 if regression:
-    x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...][:, None]
+    x = torch.tensor(start_ids, dtype=torch.float32, device=device)[None, ...]
 else:
     x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+data = torch.tensor(data, dtype=torch.float32, device=device)[None, ...]
 
 # run generation
 with torch.no_grad():
     with ctx:
-        for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            data = [int(65*sin(i*0.1 + 6)/2) + 65/2 for i in range(max_new_tokens)]
-            # plot data and predictions together
-            plt.plot(data)
-            plt.plot(y[0].tolist())
+        if regression:
+            current = model.generate(x, prediction_length, temperature=temperature, top_k=top_k)
+            output = current.clone()
+            for i in range(num_start_samples, data.shape[1] - prediction_length):
+                current = data[:, :i + 1]
+                current = model.generate(current, prediction_length, temperature=temperature, top_k=top_k)
+                output = torch.cat((output, current[:, -1:]), 1)
+            y_actual = data[0].cpu().numpy()
+            y_actual = restore_scale(y_actual)
+            y_predicted = output[0].cpu().numpy()
+            y_predicted = restore_scale(y_predicted)
+            mse = mean_squared_error(y_actual, y_predicted)
+            rmse = np.sqrt(mse)
+            mape = mean_absolute_percentage_error(y_actual, y_predicted)
+            smape = symmetric_mean_absolute_percentage_error(y_actual, y_predicted)
+            smape2 = symmetric_mean_absolute_percentage_error2(y_actual, y_predicted)
+            smape3 = symmetric_mean_absolute_percentage_error3(y_actual, y_predicted)
+            mae = mean_absolute_error(y_actual, y_predicted)
+            mase = mean_absolute_scaled_error(y_actual, y_predicted)
+            mase2 = mean_absolute_scaled_error2(y_actual, y_predicted)
+            r2 = r2_score(y_actual, y_predicted)
+            print('MSE: ', mse)
+            print('RMSE: ', rmse)
+            print('MAPE: ', mape)
+            print('SMAPE: ', smape)
+            print('SMAPE2: ', smape2)
+            print('SMAPE3: ', smape3)
+            print('MAE: ', mae)
+            print('MASE: ', mase)
+            print('MASE2: ', mase2)
+            print('R2: ', r2)
+            plt.plot(y_actual)
+            plt.plot(y_predicted, linestyle='dashed')
             plt.show()
-            # print(decode(y[0].tolist()))
-            print('---------------')
+        else:
+            for k in range(num_samples):
+                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                print(decode(y[0].tolist()))
+                print('---------------')

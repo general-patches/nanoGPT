@@ -1,6 +1,6 @@
 # train a miniature time-series model on a simple sine graph
 
-out_dir = 'out-time-series-sine'
+out_dir = 'out-sunspot'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -9,16 +9,16 @@ log_interval = 10 # don't print too too often
 always_save_checkpoint = False
 
 wandb_log = False # override via command line if you like
-wandb_project = 'time-series-sine'
+wandb_project = 'time-series-sunspot'
 wandb_run_name = 'positionless-run'
 
-dataset = 'time_series_sine'
+dataset = 'sunspot'
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256 # context of up to 256 previous characters
 
 # baby GPT model :)
-n_layer = 2
+n_layer = 4
 n_head = 6
 n_embd = 18
 dropout = 0

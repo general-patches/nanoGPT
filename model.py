@@ -95,15 +95,21 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        if self.config.regression:
+            x = x + self.attn(x)
+            x = x + self.mlp(x)
+            return x
+        else:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+            return x
 
 @dataclass
 class GPTConfig:
@@ -180,18 +186,22 @@ class GPT(nn.Module):
             # print('input')
             # print(idx[0])
             idx = idx[:,:,None]
-            pos_emb = self.transformer.wpe(pos)
-            # idx = idx.repeat(1, 1, self.config.n_embd)
+            idx = idx.repeat(1, 1, self.config.n_embd)
+            pos = torch.arange(0, t, dtype=torch.float32, device=device).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, self.config.n_embd, 2, dtype=torch.float32, device=device) * (-math.log(10000.0) / self.config.n_embd))
+            pos_enc = pos * div_term
+            pos_enc = torch.cat((torch.sin(pos_enc), torch.cos(pos_enc)), dim=1)
+            position_encodings = pos_enc.unsqueeze(0).expand(b, -1, -1)
             # pos_emb = pos
             # for i in range(t):
             #     pos_emb[i] = math.sin(pos_emb[i]*(1/(i + 1)))
             # pos_emb = pos_emb[:,None]
             # pos_emb = pos_emb.repeat(1, self.config.n_embd)
-            # x = self.transformer.drop(idx + pos_emb)
+            x = self.transformer.drop(idx + position_encodings)
 
             # print('shaped')
             # print(idx[0])
-            x = self.transformer.drop(idx + pos_emb)
+            # x = self.transformer.drop(idx)
             # print('dropped')
             # print(idx[0])
             # print(idx.shape)
@@ -220,7 +230,12 @@ class GPT(nn.Module):
         # print('after layers')
         # print(x[0])
         # if not self.config.regression:
-        x = self.transformer.ln_f(x)
+        # print('before layernorm: ', torch.max(x))
+        # print(x.shape)
+        if not self.config.regression:
+            x = self.transformer.ln_f(x)
+        # print('after layernorm: ', torch.max(x))
+        # print(x.shape)
         # print('after ln_f')
         # print(x[0])
 
@@ -228,7 +243,7 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = None
-            # print('logits')
+            # print('logits: ', torch.max(logits))
             # print(logits[0])
             # print('targets')
             # print(targets[0])
@@ -238,7 +253,7 @@ class GPT(nn.Module):
             # print(targets.view(-1).shape)
             # exit()
             if self.config.regression:
-                loss = F.mse_loss(logits.view(-1), targets.view(-1), reduction='sum')
+                loss = F.mse_loss(logits.view(-1), targets.view(-1), reduction='mean')
             else:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
