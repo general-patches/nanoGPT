@@ -1,6 +1,5 @@
 # train a miniature time-series model on a simple sine graph
 
-out_dir = 'out-sunspot'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -13,6 +12,7 @@ wandb_project = 'time-series-sunspot'
 wandb_run_name = 'positionless-run'
 
 dataset = 'sunspot'
+out_dir = f'out-{dataset}'
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256 # context of up to 256 previous characters
@@ -23,6 +23,7 @@ n_head = 6
 n_embd = 18
 dropout = 0
 regression = True
+position_encoding = 't2v'
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
 max_iters = 5000

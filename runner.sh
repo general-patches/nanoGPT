@@ -1,0 +1,1 @@
+python benchmark.py '.\config\train_sine.py' --position_encoding=random

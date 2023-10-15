@@ -15,6 +15,55 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+def custom_position_encoding(seq_length, embedding_dim, device):
+    position_encodings = torch.zeros(seq_length, embedding_dim, device=device)
+    
+    # Calculate the frequency halving factor for the sine functions
+    freq_halving_factor = 2.0 ** torch.arange(0, embedding_dim // 2, dtype=torch.float32, device=device)
+
+    # Calculate the scaling factor for the second half
+    scaling_factor = 1.0 - (torch.arange(embedding_dim // 2, embedding_dim, dtype=torch.float32, device=device) / (embedding_dim // 2))
+
+    # Generate position encodings
+    for pos in range(seq_length):
+        position = torch.tensor([pos], dtype=torch.float32, device=device)
+        position_encodings[pos, :embedding_dim // 2] = torch.sin(position / freq_halving_factor)
+        position_encodings[pos, embedding_dim // 2:] = torch.sin(position / freq_halving_factor) * scaling_factor
+
+    return position_encodings
+
+# t2v implementation from https://github.com/ojus1/Time2Vec-PyTorch/blob/master/periodic_activations.py
+def t2v(tau, f, w, b, w0, b0):
+    v1 = f(torch.matmul(tau, w) + b)
+    v2 = torch.matmul(tau, w0) + b0
+    return torch.cat([v1, v2], -1)
+
+class SineActivation(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(SineActivation, self).__init__()
+        self.out_features = out_features
+        self.w0 = nn.parameter.Parameter(torch.randn(in_features, 1))
+        self.b0 = nn.parameter.Parameter(torch.randn(1))
+        self.w = nn.parameter.Parameter(torch.randn(in_features, out_features-1))
+        self.b = nn.parameter.Parameter(torch.randn(out_features-1))
+        self.f = torch.sin
+
+    def forward(self, tau):
+        return t2v(tau, self.f, self.w, self.b, self.w0, self.b0)
+
+# class CosineActivation(nn.Module):
+#     def __init__(self, in_features, out_features):
+#         super(CosineActivation, self).__init__()
+#         self.out_features = out_features
+#         self.w0 = nn.parameter.Parameter(torch.randn(in_features, 1))
+#         self.b0 = nn.parameter.Parameter(torch.randn(1))
+#         self.w = nn.parameter.Parameter(torch.randn(in_features, out_features-1))
+#         self.b = nn.parameter.Parameter(torch.randn(out_features-1))
+#         self.f = torch.cos
+
+#     def forward(self, tau):
+#         return t2v(tau, self.f, self.out_features, self.w, self.b, self.w0, self.b0)
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -121,6 +170,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     regression: bool = False # True: regression, False: classification
+    position_encoding: str = 'none' # 'none', 't2v', 'custom'
 
 class GPT(nn.Module):
 
@@ -132,10 +182,12 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd, _freeze=config.position_encoding == 'random'),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            sineact = SineActivation(config.vocab_size, config.n_embd)
+            # cosineact = CosineActivation(config.n_embd, config.n_embd)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -178,37 +230,51 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        # pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         x = None
         if self.config.regression:
             # print('regression')
             # print('input')
             # print(idx[0])
-            idx = idx[:,:,None]
-            idx = idx.repeat(1, 1, self.config.n_embd)
-            pos = torch.arange(0, t, dtype=torch.float32, device=device).unsqueeze(1)
-            div_term = torch.exp(torch.arange(0, self.config.n_embd, 2, dtype=torch.float32, device=device) * (-math.log(10000.0) / self.config.n_embd))
-            pos_enc = pos * div_term
-            pos_enc = torch.cat((torch.sin(pos_enc), torch.cos(pos_enc)), dim=1)
-            position_encodings = pos_enc.unsqueeze(0).expand(b, -1, -1)
-            # pos_emb = pos
-            # for i in range(t):
-            #     pos_emb[i] = math.sin(pos_emb[i]*(1/(i + 1)))
-            # pos_emb = pos_emb[:,None]
-            # pos_emb = pos_emb.repeat(1, self.config.n_embd)
-            x = self.transformer.drop(idx + position_encodings)
-
-            # print('shaped')
-            # print(idx[0])
-            # x = self.transformer.drop(idx)
-            # print('dropped')
-            # print(idx[0])
-            # print(idx.shape)
-            # print(idx[0][0][0])
-            # print(idx[0][0][0].dtype)
-            # exit()
+            if self.config.position_encoding == 'none':
+                idx = idx[:,:,None]
+                idx = idx.repeat(1, 1, self.config.n_embd)
+                x = self.transformer.drop(idx)
+            elif self.config.position_encoding == 't2v':
+                idx = idx[:,:,None]
+                idx = idx.repeat(1, 1, self.config.n_embd)
+                pos = torch.arange(0, t, dtype=torch.float32, device=device).unsqueeze(1)
+                position_encodings = self.transformer.sineact(pos)
+                # pos = torch.arange(0, t, dtype=torch.float32, device=device).unsqueeze(1)
+                # div_term = torch.exp(torch.arange(0, self.config.n_embd, 2, dtype=torch.float32, device=device) * (-math.log(10000.0) / self.config.n_embd))
+                # pos_enc = pos * div_term
+                # pos_enc = torch.cat((torch.sin(pos_enc), torch.cos(pos_enc)), dim=1)
+                # position_encodings = pos_enc.unsqueeze(0).expand(b, -1, -1)
+                x = self.transformer.drop(idx + position_encodings)
+            elif self.config.position_encoding == 'vaswani':
+                idx = idx[:,:,None]
+                idx = idx.repeat(1, 1, self.config.n_embd)
+                pos = torch.arange(0, t, dtype=torch.float32, device=device).unsqueeze(1)
+                div_term = torch.exp(torch.arange(0, self.config.n_embd, 2, dtype=torch.float32, device=device) * (-math.log(10000.0) / self.config.n_embd))
+                pos_enc = pos * div_term
+                pos_enc = torch.cat((torch.sin(pos_enc), torch.cos(pos_enc)), dim=1)
+                position_encodings = pos_enc.unsqueeze(0).expand(b, -1, -1)
+                x = self.transformer.drop(idx + position_encodings)
+            elif self.config.position_encoding == 'custom':
+                idx = idx[:,:,None]
+                idx = idx.repeat(1, 1, self.config.n_embd)
+                pos_enc = custom_position_encoding(t, self.config.n_embd, device)
+                position_encodings = pos_enc.unsqueeze(0).expand(b, -1, -1)
+                x = self.transformer.drop(idx + position_encodings)
+            elif self.config.position_encoding == 'random':
+                pos = torch.arange(0, t, dtype=torch.long, device=device)
+                idx = idx[:,:,None]
+                idx = idx.repeat(1, 1, self.config.n_embd)
+                pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+                x = self.transformer.drop(idx + pos_emb)
         else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
             tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
             x = self.transformer.drop(tok_emb + pos_emb)

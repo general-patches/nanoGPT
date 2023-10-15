@@ -26,6 +26,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = False # use PyTorch 2.0 to compile the model to be faster
 num_start_samples = 50
 prediction_length = 10
+predict_in_steps = True
 exec(open('configurator.py').read()) # overrides from command line or config file
 
 data = None
@@ -58,8 +59,8 @@ def mean_absolute_scaled_error(actual, predicted):
 def symmetric_mean_absolute_percentage_error(acutal, predicted):
     return 100 * np.mean(np.abs(predicted - acutal) / ((np.abs(acutal) + np.abs(predicted)) / 2))
 
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
+# torch.manual_seed(seed)
+# torch.cuda.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -128,12 +129,15 @@ data = torch.tensor(data, dtype=torch.float32, device=device)[None, ...]
 with torch.no_grad():
     with ctx:
         if regression:
-            current = model.generate(x, prediction_length, temperature=temperature, top_k=top_k)
-            output = current.clone()
-            for i in range(num_start_samples, data.shape[1] - prediction_length):
-                current = data[:, :i + 1]
-                current = model.generate(current, prediction_length, temperature=temperature, top_k=top_k)
-                output = torch.cat((output, current[:, -1:]), 1)
+            if predict_in_steps:
+                current = model.generate(x, prediction_length, temperature=temperature, top_k=top_k)
+                output = current.clone()
+                for i in range(num_start_samples, data.shape[1] - prediction_length):
+                    current = data[:, :i + 1]
+                    current = model.generate(current, prediction_length, temperature=temperature, top_k=top_k)
+                    output = torch.cat((output, current[:, -1:]), 1)
+            else:
+                output = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             y_actual = data[0].cpu().numpy()
             y_actual = restore_scale(y_actual)
             y_predicted = output[0].cpu().numpy()

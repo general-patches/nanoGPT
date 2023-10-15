@@ -3,7 +3,7 @@ This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
 To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
+$ python train.py --batch_size=32
 
 To run with DDP on 4 gpus on 1 node, example:
 $ torchrun --standalone --nproc_per_node=4 train.py
@@ -26,6 +26,8 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from sklearn.metrics import r2_score, mean_absolute_percentage_error, mean_absolute_error, mean_squared_error
+
 
 from model import GPTConfig, GPT
 
@@ -38,7 +40,6 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -73,7 +74,9 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+num_start_samples = 50
+prediction_length = 10
+predict_in_steps = True
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -137,7 +140,6 @@ def get_batch(split):
         x, y = x.to(device), y.to(device)
     return x, y
 
-# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
 
@@ -153,49 +155,17 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout, regression=regression, position_encoding=position_encoding) # start with model_args from command line
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    if regression:
-        model_args['vocab_size'] = 1
-    else:
-        model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 65
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+# init a new model from scratch
+print("Initializing a new model from scratch")
+# determine the vocab size we'll use for from-scratch training
+if meta_vocab_size is None:
+    print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+if regression:
+    model_args['vocab_size'] = 1
+else:
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 65
+gptconf = GPTConfig(**model_args)
+model = GPT(gptconf)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -207,15 +177,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
-
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
@@ -341,6 +303,85 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+model = raw_model
+model.load_state_dict(checkpoint['model'])
+model.eval()
+model.to(device)
+
+data = None
+mean = None
+std = None
+if regression:
+    temperature = 1.0
+    data = np.memmap(os.path.join('data', dataset, 'test.bin'), dtype=np.float32, mode='r')
+    max_new_tokens = len(data) - num_start_samples
+    start = data[:num_start_samples]
+    with open(os.path.join('data', dataset, 'meta.txt'), 'r') as f:
+        mean = float(f.readline().split('=')[1])
+        std = float(f.readline().split('=')[1])
+# -----------------------------------------------------------------------------
+
+def restore_scale(input):
+    return input * std + mean
+
+def mean_absolute_error_naive(actual):
+    sum = 0
+    for i in range(1, len(actual)):
+        sum += abs(actual[i] - actual[i - 1])
+    return sum / (len(actual) - 1)
+
+def mean_absolute_scaled_error(actual, predicted):
+    mae = mean_absolute_error(actual, predicted)
+    naive_mae = mean_absolute_error_naive(actual)
+    return mae / naive_mae
+
+def symmetric_mean_absolute_percentage_error(acutal, predicted):
+    return 100 * np.mean(np.abs(predicted - acutal) / ((np.abs(acutal) + np.abs(predicted)) / 2))
+
+start_ids = start
+x = torch.tensor(start_ids, dtype=torch.float32, device=device)[None, ...]
+data = torch.tensor(data, dtype=torch.float32, device=device)[None, ...]
+
+with torch.no_grad():
+    with ctx:
+        if predict_in_steps:
+            current = model.generate(x, prediction_length, temperature=temperature)
+            output = current.clone()
+            for i in range(num_start_samples, data.shape[1] - prediction_length):
+                current = data[:, :i + 1]
+                current = model.generate(current, prediction_length, temperature=temperature)
+                output = torch.cat((output, current[:, -1:]), 1)
+        else:
+            output = model.generate(x, max_new_tokens, temperature=temperature)
+        y_actual = data[0].cpu().numpy()
+        y_actual = restore_scale(y_actual)
+        y_predicted = output[0].cpu().numpy()
+        y_predicted = restore_scale(y_predicted)
+        mse = mean_squared_error(y_actual, y_predicted)
+        rmse = np.sqrt(mse)
+        mape = mean_absolute_percentage_error(y_actual, y_predicted)
+        smape = symmetric_mean_absolute_percentage_error(y_actual, y_predicted)
+        mae = mean_absolute_error(y_actual, y_predicted)
+        mase = mean_absolute_scaled_error(y_actual, y_predicted)
+        r2 = r2_score(y_actual, y_predicted)
+        print('MSE: ', mse)
+        print('RMSE: ', rmse)
+        print('MAPE: ', mape)
+        print('SMAPE: ', smape)
+        print('MAE: ', mae)
+        print('MASE: ', mase)
+        print('R2: ', r2)
+        with open(os.path.join(f"{out_dir}", 'results.txt'), 'a') as f:
+            f.write(f"PE={position_encoding},")
+            f.write(f"DATASET={dataset},")
+            f.write(f"MSE={mse},")
+            f.write(f"RMSE={rmse},")
+            f.write(f"MAPE={mape},")
+            f.write(f"SMAPE={smape},")
+            f.write(f"MAE={mae},")
+            f.write(f"MASE={mase},")
+            f.write(f"R2={r2}\n")
 
 if ddp:
     destroy_process_group()
